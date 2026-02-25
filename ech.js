@@ -1,9 +1,10 @@
 import { connect } from 'cloudflare:sockets';
-// v1.6.0
+// v1.7.0
 
 const WS_READY_STATE_OPEN = 1;
 const WS_READY_STATE_CLOSING = 2;
 const CF_FALLBACK_IPS = ['cdn.xn--b6gac.eu.org']; // fallback
+const CACHE_TTL = 60 * 1000; // 远程配置内存缓存时长（毫秒）
 
 // 复用 TextEncoder，避免重复创建
 const encoder = new TextEncoder();
@@ -46,8 +47,8 @@ export default {
                 if (urlPath === '/admin') {
                     return handleAdminPage(env.ADMIN_PASSWORD);
                 }
-                // 配置数据直出
-                if (urlPath.startsWith('/sub/')) {
+                // 配置数据直出（自定义路径，匹配非保留路由）
+                if (urlPath !== '/' && urlPath !== '/admin' && !urlPath.startsWith('/api/')) {
                     return handleSubRequest(request, TOKEN_JSON_URL, GITHUB_TOKEN, urlPath);
                 }
                 // 管理后台读写 API
@@ -97,7 +98,6 @@ export default {
 
 let remoteTokenCache = null;
 let lastCacheTime = 0;
-const CACHE_TTL = 60 * 1000;
 
 // 默认内置的兜底配置
 const fallbackData = {
@@ -121,11 +121,25 @@ async function verifyWithRemoteJson(url, githubToken, clientToken) {
         let fetchUrl = url;
         if (url.includes('api.github.com/repos/')) {
             headers['Accept'] = 'application/vnd.github.v3.raw';
-        } else if (url.includes('github.com') && !url.includes('raw.githubusercontent.com')) {
-            fetchUrl = url.replace('github.com', 'raw.githubusercontent.com').replace('/blob/', '/').replace('/tree/', '/');
+        } else if (url.includes('github.com') || url.includes('raw.githubusercontent.com')) {
+            if (githubToken) {
+                // 有 Token 时走 GitHub API，彻底避免 raw.githubusercontent.com 的 5 分钟 CDN 缓存
+                let rawUrl = url;
+                if (!url.includes('raw.githubusercontent.com')) {
+                    rawUrl = url.replace('github.com', 'raw.githubusercontent.com').replace('/blob/', '/').replace('/tree/', '/');
+                }
+                const seg = rawUrl.split('raw.githubusercontent.com/')[1];
+                if (seg) {
+                    const p = seg.split('/');
+                    fetchUrl = `https://api.github.com/repos/${p[0]}/${p[1]}/contents/${p.slice(3).join('/')}`;
+                    headers['Accept'] = 'application/vnd.github.v3.raw';
+                }
+            } else if (!url.includes('raw.githubusercontent.com')) {
+                fetchUrl = url.replace('github.com', 'raw.githubusercontent.com').replace('/blob/', '/').replace('/tree/', '/');
+            }
         }
 
-        const res = await fetch(fetchUrl, { headers });
+        const res = await fetch(fetchUrl, { headers, cf: { cacheTtl: 0 } });
         if (!res.ok) {
             console.error('Fetch remote token JSON failed:', res.status, res.statusText);
             if (remoteTokenCache) return checkTokenInConfig(remoteTokenCache, clientToken, now);
@@ -189,16 +203,27 @@ async function getRemoteConfig(url, githubToken) {
 
 // ============== 主页 - 运行时长展示 ==============
 
-// Token 到期查询 API（公开，无需管理密码）
+// Token 到期查询 API（公开，无需管理密码，支持 Token 或备注搜索）
 async function handleApiCheckToken(request, url, githubToken) {
     try {
         const body = await request.json();
-        const token = body?.token;
-        if (!token) return new Response(JSON.stringify({ error: 'Token 不能为空' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+        const keyword = body?.token;
+        if (!keyword) return new Response(JSON.stringify({ error: 'Token 或备注不能为空' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
 
         const config = await getRemoteConfig(url, githubToken);
         const now = Date.now();
-        const result = checkTokenInConfig(config, token, now);
+
+        // 先按 token 精确匹配
+        let result = checkTokenInConfig(config, keyword, now);
+
+        // 未命中则按 remark 模糊匹配
+        if (!result) {
+            const tokens = config?.tokens || (Array.isArray(config) ? config : []);
+            const byRemark = tokens.find(item => item.remark && item.remark.includes(keyword));
+            if (byRemark) {
+                result = checkTokenInConfig(config, byRemark.token, now);
+            }
+        }
 
         if (!result) {
             return new Response(JSON.stringify({ found: false }), { headers: { 'Content-Type': 'application/json' } });
@@ -219,7 +244,7 @@ async function handleApiCheckToken(request, url, githubToken) {
             }
         }
 
-        return new Response(JSON.stringify({ found: true, status, expire: result.expire || null, remark: result.remark || null }), { headers: { 'Content-Type': 'application/json' } });
+        return new Response(JSON.stringify({ found: true, status, expire: result.expire || null, remark: result.remark || null, token: result.token, ipLimit: result.ipLimit || 5, subPath: result.subPath || '' }), { headers: { 'Content-Type': 'application/json' } });
     } catch (e) {
         return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: { 'Content-Type': 'application/json' } });
     }
@@ -304,6 +329,15 @@ async function handleHomePage(url, githubToken) {
         .sub-result .copy-btn { margin-top: 8px; width: 100%; padding: 10px; border: none; border-radius: 8px; background: linear-gradient(135deg, #3b82f6, #6366f1); color: white; font-size: 13px; font-weight: 600; cursor: pointer; }
         .sub-result .copy-btn:hover { opacity: 0.85; }
         .sub-result .node-count { font-size: 12px; color: rgba(255,255,255,0.5); margin-top: 8px; text-align: center; }
+        @media (max-width: 600px) {
+            .glass-panel { padding: 30px 20px; width: 90%; }
+            .timer-box { font-size: 24px; }
+            .query-box { flex-direction: column; }
+            .query-box input { width: 100%; box-sizing: border-box; }
+            .query-box button { width: 100%; }
+            .ipsel-tools { flex-direction: column; align-items: stretch; }
+            .ipsel-tools button { width: 100%; }
+        }
     </style>
 </head>
 <body>
@@ -315,7 +349,7 @@ async function handleHomePage(url, githubToken) {
         <div class="timer-box" id="timer">00  00  00  00</div>
         <div class="labels"><span>天(Days)</span><span>时(Hrs)</span><span>分(Mins)</span><span>秒(Secs)</span></div>
         <div class="query-box">
-            <input type="text" id="tokenInput" placeholder="输入你的 Token 查询到期时间" onkeyup="if(event.key==='Enter') queryToken()">
+            <input type="text" id="tokenInput" placeholder="输入 Token 或备注查询" onkeyup="if(event.key==='Enter') queryToken()">
             <button onclick="queryToken()">&#x1F50D; 查询</button>
         </div>
         <div class="result-box" id="resultBox"></div>
@@ -324,8 +358,7 @@ async function handleHomePage(url, githubToken) {
             <div class="section-title">&#x1F30D; IP 筛选 - 选择地区</div>
             <div class="ipsel-tools">
                 <button class="btn-select-all" onclick="toggleAllRegions()">全选/取消</button>
-                <span style="font-size:11px;color:rgba(255,255,255,0.4);">每地区上限:</span>
-                <input type="number" id="ipLimit" value="10" min="1" max="100">
+                <button class="btn-select-all" onclick="selectRecommended()">⭐ 推荐地区</button>
                 <button class="btn-generate" onclick="generateCfg()">&#x26A1; 生成配置</button>
             </div>
             <div class="region-grid" id="regionGrid"><div style="grid-column:1/-1;text-align:center;color:rgba(255,255,255,0.3);padding:20px;">加载中...</div></div>
@@ -337,7 +370,7 @@ async function handleHomePage(url, githubToken) {
             </div>
         </div>
     </div>
-    <div class="footer">v1.6.0</div>
+    <div class="footer">v1.7.0</div>
 
     <script>
         var startTime = new Date("${startTimeStr}").getTime();
@@ -358,6 +391,8 @@ async function handleHomePage(url, githubToken) {
         updateTimer();
 
         var _verifiedToken = '';
+        var _verifiedSubPath = '';
+        var _tokenIpLimit = 5;
         var _selectedRegions = [];
         var _allRegions = [];
 
@@ -384,9 +419,11 @@ async function handleHomePage(url, githubToken) {
                     else if (s.indexOf('过期') >= 0) cls = 'expired';
                     else if (s.indexOf('即将') >= 0) cls = 'warn';
                     box.className = 'result-box ' + cls;
-                    box.innerText = data.status + (data.remark ? '  (' + data.remark + ')' : '');
+                    box.innerHTML = '<div>' + (data.status + (data.remark ? '  (' + data.remark + ')' : '')).replace(/</g, "&lt;") + '</div><div style="color:#10b981;font-size:13px;margin-top:6px;display:inline-block;">&#x1F4CA; 剩余流量：♾️ 无限</div>';
                     if (s.indexOf('过期') < 0) {
-                        _verifiedToken = token;
+                        _verifiedToken = data.token || token;
+                        _tokenIpLimit = data.ipLimit || 5;
+                        _verifiedSubPath = data.subPath || '';
                         panel.classList.add('show');
                         loadRegions();
                     } else {
@@ -430,21 +467,35 @@ async function handleHomePage(url, githubToken) {
             }
         }
 
+        var RECOMMENDED_REGIONS = ['US','JP','HK','TW','SG','KH','KR','PH'];
+        function selectRecommended() {
+            _selectedRegions = [];
+            document.querySelectorAll('.region-card').forEach(function(c) {
+                var r = c.getAttribute('data-r');
+                if (RECOMMENDED_REGIONS.indexOf(r) >= 0) {
+                    _selectedRegions.push(r);
+                    c.classList.add('active');
+                } else {
+                    c.classList.remove('active');
+                }
+            });
+        }
+
         function generateCfg() {
             if (!_verifiedToken) { alert('请先查询有效 Token'); return; }
             if (_selectedRegions.length === 0) { alert('请至少选择一个地区'); return; }
-            var limit = parseInt(document.getElementById('ipLimit').value) || 10;
             var btn = document.querySelector('.btn-generate');
             btn.innerText = '生成中...';
             btn.disabled = true;
             fetch('/api/ipsel', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ token: _verifiedToken, regions: _selectedRegions, limit: limit })
+                body: JSON.stringify({ token: _verifiedToken, regions: _selectedRegions })
             }).then(function(res) { return res.json(); }).then(function(data) {
                 if (data.error) { alert(data.error); return; }
                 document.getElementById('subResult').classList.add('show');
-                document.getElementById('cfgLink').value = window.location.origin + '/sub/' + _verifiedToken + '?regions=' + _selectedRegions.join(',') + '&limit=' + limit;
+                var sp = _verifiedSubPath || _verifiedToken;
+                document.getElementById('cfgLink').value = window.location.origin + '/' + sp;
                 document.getElementById('nodeCount').innerText = '共 ' + data.count + ' 条记录';
             }).catch(function(e) { alert('生成失败: ' + e.message); }).finally(function() {
                 btn.innerText = '生成配置';
@@ -495,7 +546,7 @@ async function handleApiRegions() {
 async function handleApiIPSelect(request, tokenUrl, githubToken) {
     try {
         const body = await request.json();
-        const { token, regions, limit = 10 } = body;
+        const { token, regions } = body;
         if (!token) return new Response(JSON.stringify({ error: 'Token 不能为空' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
         if (!regions || !regions.length) return new Response(JSON.stringify({ error: '请选择至少一个地区' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
 
@@ -504,6 +555,8 @@ async function handleApiIPSelect(request, tokenUrl, githubToken) {
         const now = Date.now();
         const tokenResult = checkTokenInConfig(config, token, now);
         if (!tokenResult || tokenResult._expired) return new Response(JSON.stringify({ error: 'Token 无效或已过期' }), { status: 403, headers: { 'Content-Type': 'application/json' } });
+
+        const limit = tokenResult.ipLimit || 5;
 
         // 拉取筛选数据
         const ipRes = await fetch(DATA_FEED_URL);
@@ -567,22 +620,30 @@ async function handleApiIPSelect(request, tokenUrl, githubToken) {
     }
 }
 
-// 配置数据直出
+// 配置数据直出（通过 subPath 或 token 查找）
 async function handleSubRequest(request, tokenUrl, githubToken, urlPath) {
     try {
         const url = new URL(request.url);
-        // /sub/{token}?regions=JP,US&limit=10
-        const token = urlPath.replace('/sub/', '');
-        const regions = (url.searchParams.get('regions') || '').split(',').filter(r => r);
-        const limit = parseInt(url.searchParams.get('limit')) || 10;
+        // /{subPath}?regions=JP,US
+        const pathKey = urlPath.replace(/^\//, '');
+        const urlRegions = (url.searchParams.get('regions') || '').split(',').filter(r => r);
 
-        if (!token || !regions.length) return new Response('', { status: 400 });
+        if (!pathKey) return new Response('', { status: 400 });
 
-        // Token 鉴权
+        // 获取配置并通过 subPath 或 token 查找对应用户
         const config = await getRemoteConfig(tokenUrl, githubToken);
         const now = Date.now();
-        const tokenResult = checkTokenInConfig(config, token, now);
+        const tokens = config?.tokens || (Array.isArray(config) ? config : []);
+        const matched = tokens.find(item => item.subPath === pathKey) || tokens.find(item => item.token === pathKey);
+        if (!matched) return new Response('Not Found', { status: 404 });
+
+        const tokenResult = checkTokenInConfig(config, matched.token, now);
         if (!tokenResult || tokenResult._expired) return new Response('Unauthorized', { status: 403 });
+
+        const limit = tokenResult.ipLimit || 5;
+        // 地区优先级：URL 参数 > Token 配置 > 推荐地区
+        const FALLBACK_REGIONS = ['US', 'JP', 'HK', 'TW', 'SG', 'KH', 'KR', 'PH'];
+        const regions = urlRegions.length > 0 ? urlRegions : (matched.regions && matched.regions.length > 0 ? matched.regions : FALLBACK_REGIONS);
 
         // 拉取数据
         const ipRes = await fetch(DATA_FEED_URL);
@@ -627,7 +688,7 @@ async function handleSubRequest(request, tokenUrl, githubToken, urlPath) {
             const port = ipPort.split(':')[1] || '443';
             const sch = 'v' + 'le' + 'ss';
             const qs = ['encry' + 'ption=none', 'secu' + 'rity=tls', 'sni=' + hostname, 'fp=chrome', 'ty' + 'pe=ws', 'host=' + hostname, 'path=%2F'].join('&');
-            const link = sch + '://' + encodeURIComponent(token) + '@' + ip + ':' + port + '?' + qs + '#' + encodeURIComponent(nodeName);
+            const link = sch + '://' + encodeURIComponent(matched.token) + '@' + ip + ':' + port + '?' + qs + '#' + encodeURIComponent(nodeName);
             nodeLinks.push(link);
         }
 
@@ -672,11 +733,13 @@ function handleAdminPage(pwd) {
         button.danger { background: white; color: var(--danger); border: 1px solid var(--danger); padding: 4px 8px; font-size: 12px; }
         button.danger:hover { background: var(--danger); color: white; }
         .global-settings { background: #f1f5f9; padding: 15px; border-radius: 6px; margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; }
-        table { width: 100%; border-collapse: collapse; margin-bottom: 20px; font-size: 14px; }
-        th, td { text-align: left; padding: 12px; border-bottom: 1px solid var(--border); }
+        table { width: 100%; border-collapse: collapse; margin-bottom: 20px; font-size: 13px; white-space: nowrap; }
+        th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--border); }
         th { background: #f8fafc; font-weight: 600; color: #475569; }
+        td { vertical-align: middle; }
         tr:hover { background: #f1f5f9; }
-        .actions { display: flex; gap: 10px; flex-wrap: wrap; }
+        .actions { display: flex; gap: 6px; flex-wrap: wrap; max-width: 200px; }
+        .actions button { padding: 4px 8px; font-size: 12px; }
         .add-row { display: flex; gap: 10px; margin-bottom: 20px; background: #e0f2fe; padding: 15px; border-radius: 6px; flex-wrap: wrap; align-items: center; }
         .quick-btns { display: flex; gap: 5px; flex-wrap: wrap; }
         .quick-btns button { padding: 4px 10px; font-size: 12px; background: #e2e8f0; color: #334155; border: 1px solid #cbd5e1; font-weight: 400; }
@@ -688,6 +751,42 @@ function handleAdminPage(pwd) {
         .days-left.forever { color: #6366f1; }
         .inline-days-input { width: 60px; padding: 4px 8px; font-size: 12px; }
         #toast { position: fixed; bottom: 20px; right: 20px; background: #333; color: white; padding: 10px 20px; border-radius: 4px; opacity: 0; transition: opacity 0.3s; pointer-events: none; }
+        .table-responsive { width: 100%; overflow-x: auto; margin-top: 10px; }
+        .modal-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 100; align-items: center; justify-content: center; }
+        .modal-overlay.show { display: flex; }
+        .modal-box { background: white; padding: 24px; border-radius: 8px; width: 90%; max-width: 500px; box-shadow: 0 10px 25px rgba(0,0,0,0.2); max-height: 90vh; overflow-y: auto; }
+        .modal-title { font-size: 18px; font-weight: 600; margin-top: 0; margin-bottom: 20px; border-bottom: 1px solid var(--border); padding-bottom: 10px; }
+        .form-group { margin-bottom: 15px; }
+        .form-group label { display: block; font-size: 13px; color: #64748b; margin-bottom: 5px; font-weight: 500; }
+        .form-group input { width: 100%; box-sizing: border-box; }
+        .form-row { display: flex; gap: 15px; }
+        .form-row .form-group { flex: 1; }
+        .modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 25px; }
+        @media (max-width: 768px) {
+            body { padding: 0; background: var(--border); }
+            .container { padding: 15px; width: 100%; border: none; border-radius: 0; box-shadow: none; min-height: 100vh; }
+            h1 { font-size: 18px; flex-direction: column; gap: 12px; align-items: stretch; }
+            h1 button { width: 100%; }
+            .global-settings { flex-direction: column; align-items: stretch; gap: 15px; }
+            .global-settings > div { display: flex; flex-direction: column; gap: 6px; }
+            .add-row { flex-direction: column; align-items: stretch; padding: 15px; gap: 12px; }
+            .add-row > div { width: 100%; }
+            .add-row > * { width: 100%; flex: none; box-sizing: border-box; }
+            .form-row { flex-direction: column; gap: 0; }
+            table, thead, tbody, th, td, tr { display: block; }
+            thead tr { position: absolute; top: -9999px; left: -9999px; }
+            tr { border: 1px solid var(--border); margin-bottom: 15px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); background: #fff; }
+            td { border: none; border-bottom: 1px solid #f1f5f9; position: relative; padding: 6px 10px 6px 35%; display: flex; align-items: center; justify-content: flex-end; text-align: right; min-height: 32px; white-space: normal; }
+            td::before { position: absolute; left: 10px; width: 30%; white-space: nowrap; font-weight: 600; text-align: left; content: attr(data-label); color: #64748b; font-size: 13px; }
+            td:last-child { border-bottom: 0; padding: 12px; justify-content: center; background: #f8fafc; border-radius: 0 0 8px 8px; }
+            td:last-child::before { display: none; }
+            .actions { max-width: 100%; width: 100%; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+            .actions button { padding: 8px; margin: 0; width: 100%; }
+            .table-responsive { overflow: visible; }
+            table { min-width: 100%; }
+            .modal-actions { flex-direction: column; }
+            .modal-actions button { width: 100%; margin-left: 0; margin-top: 5px; }
+        }
     </style>
 </head>
 <body>
@@ -718,7 +817,9 @@ function handleAdminPage(pwd) {
                 <input type="text" id="newToken" placeholder="新 Token / UUID" style="flex:1;">
                 <button onclick="genUUID()" style="background:#8b5cf6;padding:4px 10px;font-size:16px;line-height:1;" title="随机生成 UUID">&#x1F3B2;</button>
             </div>
-            <input type="text" id="newRemark" placeholder="备注（设备名/帐号名）" style="min-width:120px;flex:0.6;">
+            <input type="text" id="newRemark" placeholder="备注（设备名/帐号名）" style="min-width:100px;flex:0.5;">
+            <input type="text" id="newSubPath" placeholder="订阅路径" style="width:80px;">
+            <input type="number" id="newIpLimit" value="5" min="1" max="100" placeholder="地区IP/个数" style="width:105px;">
             <div class="quick-btns" id="addQuickBtns">
                 <span style="font-size:12px;color:#64748b;align-self:center;">有效期:</span>
                 <button onclick="setAddExpire(1)">1天</button>
@@ -732,19 +833,88 @@ function handleAdminPage(pwd) {
             <button onclick="addToken()">&#xFF0B; 增加记录</button>
         </div>
 
-        <table>
-            <thead>
-                <tr>
-                    <th style="width: 28%">Token 凭证标识</th>
-                    <th style="width: 14%">备注</th>
-                    <th style="width: 22%">有效期状态</th>
-                    <th style="width: 36%">操作</th>
-                </tr>
-            </thead>
-            <tbody id="tokenList">
-                <tr><td colspan="4" style="text-align: center;">加载中...</td></tr>
-            </tbody>
-        </table>
+        <div style="margin-bottom: 15px; display: flex; justify-content: flex-end;">
+            <input type="text" id="adminSearch" placeholder="🔍 搜索 Token/UUID 或 备注" style="width: 250px; padding: 8px 12px; font-size: 13px; border: 1px solid var(--border); border-radius: 4px;" oninput="renderData()">
+        </div>
+
+        <div class="table-responsive">
+            <table>
+                <thead>
+                    <tr>
+                        <th style="min-width: 140px;">Token 凭证标识</th>
+                        <th style="min-width: 80px;">备注</th>
+                        <th style="min-width: 70px;">订阅路径</th>
+                        <th style="min-width: 100px;">地区</th>
+                        <th style="min-width: 90px; text-align:center;">地区IP/个数</th>
+                        <th style="min-width: 70px; text-align:center;">剩余流量</th>
+                        <th style="min-width: 100px;">有效期</th>
+                        <th style="min-width: 140px;">操作</th>
+                    </tr>
+                </thead>
+                <tbody id="tokenList">
+                    <tr><td colspan="8" style="text-align: center;">加载中...</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- 编辑弹窗 -->
+    <div id="editModal" class="modal-overlay">
+        <div class="modal-box">
+            <h3 class="modal-title">编辑 Token 记录</h3>
+            <input type="hidden" id="modal-idx">
+            
+            <div class="form-group">
+                <label>Token / UUID</label>
+                <div style="display:flex;gap:6px;">
+                    <input type="text" id="modal-token">
+                    <button onclick="document.getElementById('modal-token').value=generateUUID()" style="background:#8b5cf6;" title="随机生成 UUID">&#x1F3B2;</button>
+                </div>
+            </div>
+            
+            <div class="form-row">
+                <div class="form-group">
+                    <label>备注 (设备名/帐号名)</label>
+                    <input type="text" id="modal-remark">
+                </div>
+                <div class="form-group">
+                    <label>订阅路径</label>
+                    <input type="text" id="modal-subpath" placeholder="留空为仅Token">
+                </div>
+            </div>
+
+            <div class="form-row">
+                <div class="form-group">
+                    <label>地区 (英文逗号隔开)</label>
+                    <input type="text" id="modal-regions" placeholder="如 US,JP">
+                </div>
+                <div class="form-group">
+                    <label>地区IP/个数</label>
+                    <input type="number" id="modal-iplimit" min="1" max="100">
+                </div>
+            </div>
+
+            <div class="form-group">
+                <label>修改有效期状态</label>
+                <div class="quick-btns" style="margin-bottom:8px;">
+                    <button onclick="applyModalExpire(1)">1天</button>
+                    <button onclick="applyModalExpire(7)">1周</button>
+                    <button onclick="applyModalExpire(30)">1月</button>
+                    <button onclick="applyModalExpire(365)">1年</button>
+                    <button onclick="applyModalExpire(0)">永久</button>
+                </div>
+                <div style="display:flex;gap:4px;align-items:center;">
+                    <input type="number" id="modal-days-custom" class="inline-days-input" placeholder="自定义天数" min="1">
+                    <button onclick="applyModalExpireCustom()" style="font-size:12px;padding:4px 10px;background:#64748b;">设定</button>
+                    <span id="modal-expire-preview" style="font-size:12px;color:#f59e0b;margin-left:auto;">当前不变</span>
+                </div>
+            </div>
+
+            <div class="modal-actions">
+                <button class="danger" onclick="closeEditModal()" style="border:1px solid #cbd5e1;color:#64748b;">取消关闭</button>
+                <button onclick="saveModalEdit()" style="background:#10b981;">✅ 确认保存</button>
+            </div>
+        </div>
     </div>
 
     <div id="toast"></div>
@@ -806,83 +976,17 @@ function handleAdminPage(pwd) {
 
         function daysLeft(isoStr) {
             if (!isoStr) return { label: '♾️ 永久', cls: 'forever' };
-            const diff = new Date(isoStr).getTime() - Date.now();
-            const days = Math.floor(diff / 86400000);
+            // 使用北京时间 (UTC+8) 按日历天计算，避免时区偏差
+            var BJ = 8 * 3600000;
+            var nowBJ = new Date(Date.now() + BJ);
+            var expBJ = new Date(new Date(isoStr).getTime() + BJ);
+            var nowDay = Date.UTC(nowBJ.getUTCFullYear(), nowBJ.getUTCMonth(), nowBJ.getUTCDate());
+            var expDay = Date.UTC(expBJ.getUTCFullYear(), expBJ.getUTCMonth(), expBJ.getUTCDate());
+            var days = Math.round((expDay - nowDay) / 86400000);
             if (days < 0) return { label: '❌ 已过期 ' + Math.abs(days) + ' 天', cls: 'expired' };
             if (days === 0) return { label: '⚠️ 今天到期', cls: 'warn' };
             if (days <= 7) return { label: '⚠️ 剩 ' + days + ' 天', cls: 'warn' };
             return { label: '✅ 剩 ' + days + ' 天', cls: 'ok' };
-        }
-
-        function renderData() {
-            const st = fullData.global?.SERVER_START_TIME;
-            document.getElementById('displayStartTime').innerText = st ? new Date(st).toLocaleString() : '未设置';
-            const tbody = document.getElementById('tokenList');
-            tbody.innerHTML = '';
-            if(fullData.tokens.length === 0) {
-               tbody.innerHTML = '<tr><td colspan="4" style="text-align: center;color:#94a3b8">空空如也，请在上方添加</td></tr>';
-               return;
-            }
-            fullData.tokens.forEach((item, index) => {
-                const tr = document.createElement('tr');
-                tr.id = 'row-' + index;
-                const dl = daysLeft(item.expire);
-                const remarkText = item.remark || '';
-                const rowHtml = '' +
-                    '<td>' +
-                        '<span id="text-token-' + index + '"><code style="background:#f1f5f9;padding:2px 6px;border-radius:4px;word-break:break-all;">' + item.token + '</code></span>' +
-                        '<input type="text" id="edit-token-' + index + '" value="' + item.token + '" style="display:none; width: 100%;" />' +
-                        '<div id="edit-genUUID-' + index + '" style="display:none;margin-top:4px;">' +
-                            '<button onclick="genUUIDFor(' + index + ')" style="font-size:14px;background:#8b5cf6;padding:2px 8px;line-height:1;" title="随机生成 UUID">&#x1F3B2;</button>' +
-                        '</div>' +
-                    '</td>' +
-                    '<td>' +
-                        '<span id="text-remark-' + index + '" style="color:#64748b;font-size:12px;">' + (remarkText || '<em style="color:#cbd5e1;">无</em>') + '</span>' +
-                        '<input type="text" id="edit-remark-' + index + '" value="' + remarkText + '" placeholder="备注" style="display:none; width: 100%;" />' +
-                    '</td>' +
-                    '<td>' +
-                        '<span id="text-expire-' + index + '" class="days-left ' + dl.cls + '">' + dl.label + '</span>' +
-                        '<div id="edit-expire-' + index + '" style="display:none;">' +
-                            '<div class="quick-btns" style="margin-bottom:4px;">' +
-                                '<button onclick="applyExpire(' + index + ',1)" style="font-size:11px;">1天</button>' +
-                                '<button onclick="applyExpire(' + index + ',7)" style="font-size:11px;">1周</button>' +
-                                '<button onclick="applyExpire(' + index + ',30)" style="font-size:11px;">1月</button>' +
-                                '<button onclick="applyExpire(' + index + ',365)" style="font-size:11px;">1年</button>' +
-                                '<button onclick="applyExpire(' + index + ',0)" style="font-size:11px;">永久</button>' +
-                            '</div>' +
-                            '<div style="display:flex;gap:4px;align-items:center;">' +
-                                '<input type="number" id="days-input-' + index + '" class="inline-days-input" placeholder="自定天数" min="1" />' +
-                                '<button onclick="applyExpireCustom(' + index + ')" style="font-size:11px;padding:4px 8px;">确定</button>' +
-                            '</div>' +
-                        '</div>' +
-                    '</td>' +
-                    '<td class="actions">' +
-                        '<button id="btn-edit-' + index + '" onclick="startEdit(' + index + ')" style="background:#f59e0b; padding: 4px 10px; font-size: 12px;">✏️ 编辑</button>' +
-                        '<button id="btn-save-' + index + '" onclick="saveEdit(' + index + ')" style="background:#10b981; display:none; padding: 4px 10px; font-size: 12px;">✅ 确认</button>' +
-                        '<button id="btn-cancel-' + index + '" class="danger" onclick="cancelEdit(' + index + ')" style="display:none;"> 取消</button>' +
-                        '<button onclick="showLink(' + index + ')" style="background:#6366f1;padding:4px 10px;font-size:12px;">&#x1F517; 链接</button>' +
-                        '<button onclick="showQR(' + index + ')" style="background:#0891b2;padding:4px 10px;font-size:12px;">&#x1F4F1; 二维码</button>' +
-                        '<button id="btn-del-' + index + '" class="danger" onclick="delToken(' + index + ')">&#x1F5D1;&#xFE0F; 删除</button>' +
-                    '</td>';
-                tr.innerHTML = rowHtml;
-                tbody.appendChild(tr);
-            });
-        }
-
-        // 编辑区域中暂存各行的到期时间 {idx: isoStr or null}
-        const editExpireMap = {};
-
-        function applyExpire(idx, days) {
-            if (days === 0) { editExpireMap[idx] = null; }
-            else { const d = new Date(); d.setDate(d.getDate() + days); editExpireMap[idx] = d.toISOString(); }
-        }
-
-        function applyExpireCustom(idx) {
-            const days = parseInt(document.getElementById('days-input-' + idx).value);
-            if (!days || days < 1) { showToast('请输入有效天数', true); return; }
-            const d = new Date(); d.setDate(d.getDate() + days);
-            editExpireMap[idx] = d.toISOString();
-            showToast('已设定 ' + days + ' 天后到期');
         }
 
         // 生成标准 UUID v4
@@ -892,40 +996,142 @@ function handleAdminPage(pwd) {
                 return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
             });
         }
-
         function genUUID() { document.getElementById('newToken').value = generateUUID(); }
-        function genUUIDFor(idx) { document.getElementById('edit-token-' + idx).value = generateUUID(); }
 
-        function startEdit(idx) {
-            editExpireMap[idx] = fullData.tokens[idx].expire || null;
-            document.getElementById('text-token-' + idx).style.display = 'none';
-            document.getElementById('text-remark-' + idx).style.display = 'none';
-            document.getElementById('text-expire-' + idx).style.display = 'none';
-            document.getElementById('edit-token-' + idx).style.display = 'block';
-            document.getElementById('edit-genUUID-' + idx).style.display = 'block';
-            document.getElementById('edit-remark-' + idx).style.display = 'block';
-            document.getElementById('edit-expire-' + idx).style.display = 'block';
-            document.getElementById('btn-edit-' + idx).style.display = 'none';
-            document.getElementById('btn-del-' + idx).style.display = 'none';
-            document.getElementById('btn-save-' + idx).style.display = 'inline-block';
-            document.getElementById('btn-cancel-' + idx).style.display = 'inline-block';
+        function renderData() {
+            const st = fullData.global?.SERVER_START_TIME;
+            document.getElementById('displayStartTime').innerText = st ? new Date(st).toLocaleString() : '未设置';
+            const tbody = document.getElementById('tokenList');
+            tbody.innerHTML = '';
+            
+            const keyword = document.getElementById('adminSearch') ? document.getElementById('adminSearch').value.trim().toLowerCase() : '';
+            let displayTokens = fullData.tokens;
+            if (keyword) {
+                displayTokens = fullData.tokens.filter(item => {
+                    const t = item.token ? item.token.toLowerCase() : '';
+                    const r = item.remark ? item.remark.toLowerCase() : '';
+                    return t.includes(keyword) || r.includes(keyword);
+                });
+            }
+
+            if(displayTokens.length === 0) {
+               tbody.innerHTML = '<tr><td colspan="8" style="text-align: center;color:#94a3b8">空空如也，无匹配数据</td></tr>';
+               return;
+            }
+            displayTokens.forEach((item) => {
+                const index = fullData.tokens.indexOf(item);
+                const tr = document.createElement('tr');
+                tr.id = 'row-' + index;
+                const dl = daysLeft(item.expire);
+                const remarkText = item.remark || '';
+                const rowHtml = '' +
+                    '<td data-label="Token 凭证">' +
+                        '<span id="text-token-' + index + '"><code style="background:#f1f5f9;padding:2px 6px;border-radius:4px;word-break:break-all;white-space:normal;">' + item.token + '</code></span>' +
+                    '</td>' +
+                    '<td data-label="备注">' +
+                        '<span id="text-remark-' + index + '" style="color:#64748b;font-size:12px;white-space:normal;display:inline-block;text-align:right;">' + (remarkText || '<em style="color:#cbd5e1;">无</em>') + '</span>' +
+                    '</td>' +
+                    '<td data-label="订阅路径">' +
+                        '<span id="text-subpath-' + index + '" style="color:#3b82f6;font-size:12px;word-break:break-all;white-space:normal;">' + (item.subPath || '<em style="color:#cbd5e1;">无</em>') + '</span>' +
+                '</td>' +
+                '<td data-label="限制地区">' +
+                    '<span id="text-regions-' + index + '" style="color:#64748b;font-size:11px;word-break:break-all;white-space:normal;display:inline-block;text-align:right;">' + (item.regions ? item.regions.join(',') : '<em style="color:#cbd5e1;">默认</em>') + '</span>' +
+                '</td>' +
+                '<td data-label="地区IP/个数" style="text-align:center;">' +
+                        '<span id="text-iplimit-' + index + '">' + (item.ipLimit || 5) + '</span>' +
+                    '</td>' +
+                    '<td data-label="剩余流量" style="text-align:center;">' +
+                        '<span style="color:#10b981;font-size:12px;">♾️ 无限</span>' +
+                    '</td>' +
+                    '<td data-label="有效期">' +
+                        '<span id="text-expire-' + index + '" class="days-left ' + dl.cls + '">' + dl.label + '</span>' +
+                    '</td>' +
+                    '<td class="actions">' +
+                        '<button id="btn-edit-' + index + '" onclick="openEditModal(' + index + ')" style="background:#f59e0b;">✏️ 编辑</button>' +
+                        '<button onclick="showLink(' + index + ')" style="background:#6366f1;">&#x1F517; 链接</button>' +
+                        '<button onclick="showQR(' + index + ')" style="background:#0891b2;">&#x1F4F1; 二维码</button>' +
+                        '<button onclick="delToken(' + index + ')" class="danger">&#x1F5D1; 删除</button>' +
+                    '</td>';
+                tr.innerHTML = rowHtml;
+                tbody.appendChild(tr);
+            });
         }
 
-        function cancelEdit(idx) { delete editExpireMap[idx]; renderData(); }
+        // =============== 弹窗编辑逻辑 ===============
+        let currentEditIdx = -1;
+        let modalExpireStr = null; // null 表示不变更原有效期，'' 表示修改为永久，具体 ISO 字符串表示具体日期
 
-        function saveEdit(idx) {
-            const newToken = document.getElementById('edit-token-' + idx).value.trim();
+        function openEditModal(idx) {
+            currentEditIdx = idx;
+            modalExpireStr = null;
+            const item = fullData.tokens[idx];
+            document.getElementById('modal-idx').value = idx;
+            document.getElementById('modal-token').value = item.token || '';
+            document.getElementById('modal-remark').value = item.remark || '';
+            document.getElementById('modal-subpath').value = item.subPath || '';
+            document.getElementById('modal-regions').value = item.regions ? item.regions.join(',') : '';
+            document.getElementById('modal-iplimit').value = item.ipLimit || 5;
+            document.getElementById('modal-days-custom').value = '';
+            document.getElementById('modal-expire-preview').innerText = '当前不变';
+            document.getElementById('editModal').classList.add('show');
+        }
+
+        function closeEditModal() {
+            document.getElementById('editModal').classList.remove('show');
+            currentEditIdx = -1;
+        }
+
+        function applyModalExpire(days) {
+            if (days === 0) { 
+                modalExpireStr = ''; 
+                document.getElementById('modal-expire-preview').innerText = '将改为：永久有效';
+            } else { 
+                const d = new Date(); d.setDate(d.getDate() + days); 
+                modalExpireStr = d.toISOString();
+                document.getElementById('modal-expire-preview').innerText = '将改为：' + d.toLocaleDateString() + ' (' + days + '天后)';
+            }
+        }
+
+        function applyModalExpireCustom() {
+            const days = parseInt(document.getElementById('modal-days-custom').value);
+            if (!days || days < 1) { showToast('请输入有效天数', true); return; }
+            const d = new Date(); d.setDate(d.getDate() + days);
+            modalExpireStr = d.toISOString();
+            document.getElementById('modal-expire-preview').innerText = '将改为：' + d.toLocaleDateString() + ' (' + days + '天后)';
+        }
+
+        function saveModalEdit() {
+            const idx = currentEditIdx;
+            if (idx < 0) return;
+            
+            const newToken = document.getElementById('modal-token').value.trim();
             if(!newToken) { showToast('Token不能为空', true); return; }
             const duplicate = fullData.tokens.find((x, i) => i !== idx && x.token === newToken);
             if(duplicate) { showToast('Token 已存在', true); return; }
+            
             fullData.tokens[idx].token = newToken;
-            const newRemark = document.getElementById('edit-remark-' + idx).value.trim();
+            
+            const newRemark = document.getElementById('modal-remark').value.trim();
             if (newRemark) { fullData.tokens[idx].remark = newRemark; } else { delete fullData.tokens[idx].remark; }
-            if (idx in editExpireMap) {
-                if (editExpireMap[idx]) { fullData.tokens[idx].expire = editExpireMap[idx]; }
-                else { delete fullData.tokens[idx].expire; }
-                delete editExpireMap[idx];
+            
+            const newSubPath = document.getElementById('modal-subpath').value.trim();
+            if (newSubPath) { fullData.tokens[idx].subPath = newSubPath; } else { delete fullData.tokens[idx].subPath; }
+            
+            const newRegions = document.getElementById('modal-regions').value.trim();
+            if (newRegions) { 
+                fullData.tokens[idx].regions = newRegions.split(',').map(function(s){return s.trim().toUpperCase();}).filter(function(s){return s;}); 
+            } else { 
+                delete fullData.tokens[idx].regions; 
             }
+            
+            fullData.tokens[idx].ipLimit = parseInt(document.getElementById('modal-iplimit').value) || 5;
+            
+            if (modalExpireStr !== null) {
+                if (modalExpireStr === '') { delete fullData.tokens[idx].expire; }
+                else { fullData.tokens[idx].expire = modalExpireStr; }
+            }
+            
+            closeEditModal();
             showToast('单条记录修改成功');
             renderData();
         }
@@ -945,10 +1151,15 @@ function handleAdminPage(pwd) {
             const newItem = { token: t };
             const r = document.getElementById('newRemark').value.trim();
             if (r) newItem.remark = r;
+            const sp = document.getElementById('newSubPath').value.trim();
+            if (sp) newItem.subPath = sp;
+            newItem.ipLimit = parseInt(document.getElementById('newIpLimit').value) || 5;
             if(addExpireDate) newItem.expire = addExpireDate;
             fullData.tokens.push(newItem);
             document.getElementById('newToken').value = '';
             document.getElementById('newRemark').value = '';
+            document.getElementById('newSubPath').value = '';
+            document.getElementById('newIpLimit').value = '5';
             document.getElementById('newExpireDays').value = '';
             document.getElementById('addExpirePreview').innerText = '永久有效';
             addExpireDate = null;
