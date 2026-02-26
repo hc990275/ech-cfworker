@@ -1,5 +1,5 @@
 import { connect } from 'cloudflare:sockets';
-// v1.7.0
+// v1.7.2
 
 const WS_READY_STATE_OPEN = 1;
 const WS_READY_STATE_CLOSING = 2;
@@ -359,7 +359,10 @@ async function handleHomePage(url, githubToken) {
             <div class="ipsel-tools">
                 <button class="btn-select-all" onclick="toggleAllRegions()">全选/取消</button>
                 <button class="btn-select-all" onclick="selectRecommended()">⭐ 推荐地区</button>
-                <button class="btn-generate" onclick="generateCfg()">&#x26A1; 生成配置</button>
+                <button class="btn-generate" onclick="generateCfg()">⚡ 生成配置</button>
+                <label style="font-size:12px;color:rgba(255,255,255,0.6);display:flex;align-items:center;gap:4px;cursor:pointer;">
+                    <input type="checkbox" id="syncConfig" style="width:14px;height:14px;margin:0;"> 同步到帐号配置
+                </label>
             </div>
             <div class="region-grid" id="regionGrid"><div style="grid-column:1/-1;text-align:center;color:rgba(255,255,255,0.3);padding:20px;">加载中...</div></div>
             <div class="sub-result" id="subResult">
@@ -370,7 +373,7 @@ async function handleHomePage(url, githubToken) {
             </div>
         </div>
     </div>
-    <div class="footer">v1.7.0</div>
+    <div class="footer">v1.7.2</div>
 
     <script>
         var startTime = new Date("${startTimeStr}").getTime();
@@ -487,16 +490,17 @@ async function handleHomePage(url, githubToken) {
             var btn = document.querySelector('.btn-generate');
             btn.innerText = '生成中...';
             btn.disabled = true;
+            var sync = document.getElementById('syncConfig').checked;
             fetch('/api/ipsel', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ token: _verifiedToken, regions: _selectedRegions })
+                body: JSON.stringify({ token: _verifiedToken, regions: _selectedRegions, save: sync })
             }).then(function(res) { return res.json(); }).then(function(data) {
                 if (data.error) { alert(data.error); return; }
                 document.getElementById('subResult').classList.add('show');
                 var sp = _verifiedSubPath || _verifiedToken;
                 document.getElementById('cfgLink').value = window.location.origin + '/' + sp;
-                document.getElementById('nodeCount').innerText = '共 ' + data.count + ' 条记录';
+                document.getElementById('nodeCount').innerText = '共 ' + data.count + ' 条记录' + (sync ? ' (已同步到帐号)' : '');
             }).catch(function(e) { alert('生成失败: ' + e.message); }).finally(function() {
                 btn.innerText = '生成配置';
                 btn.disabled = false;
@@ -546,7 +550,7 @@ async function handleApiRegions() {
 async function handleApiIPSelect(request, tokenUrl, githubToken) {
     try {
         const body = await request.json();
-        const { token, regions } = body;
+        const { token, regions, save } = body;
         if (!token) return new Response(JSON.stringify({ error: 'Token 不能为空' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
         if (!regions || !regions.length) return new Response(JSON.stringify({ error: '请选择至少一个地区' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
 
@@ -565,6 +569,17 @@ async function handleApiIPSelect(request, tokenUrl, githubToken) {
         const lines = text.split('\n');
 
         const targetRegions = regions.map(r => r.trim().toUpperCase()).filter(r => r);
+
+        // 如果需要同步到帐号配置
+        if (save && githubToken) {
+            const tokens = config?.tokens || (Array.isArray(config) ? config : []);
+            const matched = tokens.find(item => item.token === token);
+            if (matched) {
+                matched.regions = targetRegions;
+                await commitToGithub(githubToken, tokenUrl, config);
+            }
+        }
+
         const regionPools = {};
         targetRegions.forEach(r => regionPools[r] = []);
 
@@ -1263,15 +1278,10 @@ function parseGithubUrl(rawUrl) {
     return null;
 }
 
-// 将改动写回 GitHub 远程
-async function handleApiPutTokens(request, targetUrl, githubToken) {
-    if (!githubToken) {
-        return new Response('Missing GITHUB_TOKEN on server env to commit changes.', { status: 400 });
-    }
+// 将改动一键提交并写回 GitHub 远程（内部共用方法）
+async function commitToGithub(githubToken, targetUrl, fullData) {
     const parsed = parseGithubUrl(targetUrl);
-    if (!parsed) {
-        return new Response('Unable to parse TOKEN_JSON_URL for GitHub API ops.', { status: 400 });
-    }
+    if (!parsed) throw new Error('Unable to parse TOKEN_JSON_URL for GitHub API ops.');
 
     const apiBase = `https://api.github.com/repos/${parsed.owner}/${parsed.repo}/contents/${parsed.path}`;
     const headers = {
@@ -1280,45 +1290,54 @@ async function handleApiPutTokens(request, targetUrl, githubToken) {
         'Accept': 'application/vnd.github.v3+json'
     };
 
+    // 1. 获取最新文件 SHA
+    let fileSha = undefined;
+    const getRes = await fetch(apiBase, { headers, cf: { cacheTtl: 0 } });
+    if (getRes.ok) {
+        const getJson = await getRes.json();
+        fileSha = getJson.sha;
+    }
+
+    // 2. 打包 Base64 数据
+    const newPayload = JSON.stringify(fullData, null, 2);
+    const uint8array = new TextEncoder().encode(newPayload);
+    let contentBase64 = "";
+    for (let i = 0; i < uint8array.length; i++) {
+        contentBase64 += String.fromCharCode(uint8array[i]);
+    }
+    contentBase64 = btoa(contentBase64);
+
+    const putBody = {
+        message: "Update tokens via ECH Auto-Sync",
+        content: contentBase64,
+        sha: fileSha
+    };
+
+    const putRes = await fetch(apiBase, {
+        method: 'PUT',
+        headers,
+        body: JSON.stringify(putBody)
+    });
+
+    if (!putRes.ok) {
+        throw new Error(`Git Commit Error: ${putRes.status} ${await putRes.text()}`);
+    }
+
+    // 清空本地缓存
+    remoteTokenCache = fullData;
+    lastCacheTime = Date.now();
+    return true;
+}
+
+// 将改动写回 GitHub 远程
+async function handleApiPutTokens(request, targetUrl, githubToken) {
+    if (!githubToken) {
+        return new Response('Missing GITHUB_TOKEN on server env to commit changes.', { status: 400 });
+    }
     try {
-        // 1. 获取最新文件 SHA
-        let fileSha = undefined;
-        const getRes = await fetch(apiBase, { headers });
-        if (getRes.ok) {
-            const getJson = await getRes.json();
-            fileSha = getJson.sha;
-        }
-
-        // 2. 将传入的新 JSON 发送 PUT 请求
-        const newPayload = await request.text();
-        const uint8array = new TextEncoder().encode(newPayload);
-        let contentBase64 = "";
-        for (let i = 0; i < uint8array.length; i++) {
-            contentBase64 += String.fromCharCode(uint8array[i]);
-        }
-        contentBase64 = btoa(contentBase64);
-
-        const putBody = {
-            message: "Update tokens via Admin Panel",
-            content: contentBase64,
-            sha: fileSha
-        };
-
-        const putRes = await fetch(apiBase, {
-            method: 'PUT',
-            headers,
-            body: JSON.stringify(putBody)
-        });
-
-        if (!putRes.ok) {
-            return new Response(`Git Commit Error: ${putRes.status} ${await putRes.text()}`, { status: 502 });
-        }
-
-        // 清空本地缓存，让下次请求读取最新数据
-        remoteTokenCache = null;
-
+        const fullData = await request.json();
+        await commitToGithub(githubToken, targetUrl, fullData);
         return new Response('OK', { status: 200 });
-
     } catch (e) {
         return new Response(e.message, { status: 500 });
     }

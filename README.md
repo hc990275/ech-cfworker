@@ -126,4 +126,4 @@ ceh/
 
 详见 [CHANGELOG.md](./CHANGELOG.md)
 
-**当前版本：v1.7.0**
+**当前版本：v1.7.2**
